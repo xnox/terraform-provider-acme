@@ -15,6 +15,28 @@ type resourceDataOrDiff interface {
 	GetChange(string) (any, any)
 }
 
+// writeOnlyValue reads the value of a write-only string attribute from the raw
+// configuration. Write-only values are never written to state, so they cannot
+// be read with d.Get; they are only available in the config during plan/apply.
+//
+// It returns an empty string when the attribute is absent, null, unknown, or
+// not part of this resource's schema - so it is safe to call on resources that
+// do not define the attribute, and during refresh/destroy when no config is
+// provided.
+func writeOnlyValue(d *schema.ResourceData, name string) string {
+	raw := d.GetRawConfig()
+	if raw.IsNull() || !raw.Type().IsObjectType() || !raw.Type().HasAttribute(name) {
+		return ""
+	}
+
+	v := raw.GetAttr(name)
+	if v.IsNull() || !v.IsKnown() {
+		return ""
+	}
+
+	return v.AsString()
+}
+
 // saveCertificateResource takes an certificate.Resource and sets fields.
 func saveCertificateResource(d *schema.ResourceData, cert *certificate.Resource, password string) error {
 	d.Set("certificate_url", cert.CertURL)
