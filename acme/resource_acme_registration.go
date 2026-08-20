@@ -2,6 +2,7 @@ package acme
 
 import (
 	"context"
+	"log"
 
 	"github.com/go-acme/lego/v5/acme"
 	"github.com/go-acme/lego/v5/registration"
@@ -32,10 +33,47 @@ func resourceACMERegistrationV2() *schema.Resource {
 				ForceNew:  true,
 				Sensitive: true,
 				ConflictsWith: []string{
+					"account_key_pem_wo",
 					"account_key_algorithm",
 					"account_key_ecdsa_curve",
 					"account_key_rsa_bits",
 				},
+			},
+			"account_key_pem_wo": {
+				// Write-only variant of account_key_pem. The value is supplied in
+				// the configuration but never written to state, allowing the
+				// account key to be sourced from an ephemeral resource without
+				// persisting it. Requires Terraform 1.11 or later.
+				//
+				// When this is used the account key is provided externally, so the
+				// registration is not generated and account_key_pem is left empty
+				// (the key is never echoed back as an output). The account key is
+				// unavailable during refresh and destroy (Terraform provides no
+				// config then), so the account cannot be re-resolved on refresh nor
+				// deactivated on destroy - see the Read and Delete functions.
+				Type:      schema.TypeString,
+				Optional:  true,
+				WriteOnly: true,
+				Sensitive: true,
+				ConflictsWith: []string{
+					"account_key_pem",
+					"account_key_algorithm",
+					"account_key_ecdsa_curve",
+					"account_key_rsa_bits",
+				},
+			},
+			"account_key_pem_wo_version": {
+				// Companion to account_key_pem_wo. Because the write-only value is
+				// never stored, Terraform cannot detect when it changes. Increment
+				// this integer to signal an account key rotation. As this resource
+				// has no update (it is generated once), a change forces a new
+				// resource: the account is re-registered under the new key. Note
+				// that the previous account is not deactivated, as the old key is
+				// not available during the destroy half of the replace.
+				Type:         schema.TypeInt,
+				Optional:     true,
+				ForceNew:     true,
+				RequiredWith: []string{"account_key_pem_wo"},
 			},
 			// https://letsencrypt.org/docs/integration-guide/#supported-key-algorithms
 			// NOTE: Our internal functions support more, but we need to restrict to
@@ -50,7 +88,7 @@ func resourceACMERegistrationV2() *schema.Resource {
 					false,
 				),
 				Default:       keyAlgorithmECDSA,
-				ConflictsWith: []string{"account_key_pem"},
+				ConflictsWith: []string{"account_key_pem", "account_key_pem_wo"},
 			},
 			"account_key_ecdsa_curve": {
 				Type:     schema.TypeString,
@@ -61,7 +99,7 @@ func resourceACMERegistrationV2() *schema.Resource {
 					false,
 				),
 				Default:       keyECDSACurveP384,
-				ConflictsWith: []string{"account_key_pem", "account_key_rsa_bits"},
+				ConflictsWith: []string{"account_key_pem", "account_key_pem_wo", "account_key_rsa_bits"},
 			},
 			"account_key_rsa_bits": {
 				Type:          schema.TypeInt,
@@ -69,7 +107,7 @@ func resourceACMERegistrationV2() *schema.Resource {
 				ForceNew:      true,
 				ValidateFunc:  validation.IntInSlice([]int{2048, 3072, 4096}),
 				Default:       4096,
-				ConflictsWith: []string{"account_key_pem", "account_key_ecdsa_curve"},
+				ConflictsWith: []string{"account_key_pem", "account_key_pem_wo", "account_key_ecdsa_curve"},
 			},
 			"email_address": {
 				Type:     schema.TypeString,
@@ -107,8 +145,12 @@ func resourceACMERegistrationV2() *schema.Resource {
 }
 
 func resourceACMERegistrationCreate(d *schema.ResourceData, meta any) error {
-	// If we do not have a private key, create one.
-	if d.Get("account_key_pem").(string) == "" {
+	// If we have no account key from any source, generate one. accountKeyPEM
+	// returns the key from either account_key_pem or the write-only
+	// account_key_pem_wo. When the write-only key is in use this is non-empty, so
+	// we neither generate a key nor set account_key_pem - the key is provided
+	// externally and is never persisted or output.
+	if accountKeyPEM(d) == "" {
 		privateKeyPem, err := generatePrivateKey(
 			d.Get("account_key_algorithm").(string),
 			d.Get("account_key_rsa_bits").(int),
@@ -161,6 +203,15 @@ func resourceACMERegistrationCreate(d *schema.ResourceData, meta any) error {
 }
 
 func resourceACMERegistrationRead(d *schema.ResourceData, meta any) error {
+	// Resolving the account is an authenticated request that needs the account
+	// key. With a write-only key the key is not available during refresh, so we
+	// cannot re-resolve; preserve the existing state (registration_url) as-is.
+	if accountKeyPEM(d) == "" {
+		log.Println("[WARN] no account key available during refresh (write-only key in use); " +
+			"skipping account resolution and keeping existing registration state")
+		return nil
+	}
+
 	_, user, err := expandACMEClient(d, meta, true)
 	if err != nil {
 		if regGone(err) {
@@ -176,6 +227,16 @@ func resourceACMERegistrationRead(d *schema.ResourceData, meta any) error {
 }
 
 func resourceACMERegistrationDelete(d *schema.ResourceData, meta any) error {
+	// Deactivating the account is an authenticated request that needs the account
+	// key. With a write-only key the key is not available during destroy, so the
+	// account cannot be deactivated; remove the resource from state and leave the
+	// account in place on the server.
+	if accountKeyPEM(d) == "" {
+		log.Println("[WARN] no account key available during destroy (write-only key in use); " +
+			"removing registration from state without deactivating the account")
+		return nil
+	}
+
 	client, _, err := expandACMEClient(d, meta, true)
 	if err != nil {
 		return err

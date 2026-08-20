@@ -90,6 +90,97 @@ resource "acme_certificate" "certificate" {
 }
 ```
 
+### Using a write-only account key
+
+To keep the account private key out of Terraform state entirely, supply it via
+the [write-only][wo-args] [`account_key_pem_wo`](#account_key_pem_wo) argument
+instead of [`account_key_pem`](#account_key_pem), sourcing the value from an
+[ephemeral resource][ephemeral-resources]. The key is then used by the provider
+during apply (for issuance and renewal) but is never persisted to state.
+
+This requires Terraform 1.11 or later.
+
+```hcl
+ephemeral "google_secret_manager_secret_version" "account_key" {
+  secret = "acme-account-key"
+}
+
+resource "acme_certificate" "certificate" {
+  account_key_pem_wo         = ephemeral.google_secret_manager_secret_version.account_key.secret_data
+  account_key_pem_wo_version = 1
+
+  # Required: a write-only key cannot revoke on destroy (see below).
+  revoke_certificate_on_destroy = false
+
+  common_name = "www.example.com"
+
+  dns_challenge {
+    provider = "gcloud"
+  }
+}
+```
+
+There are two important behavioral differences when using a write-only account
+key:
+
+~> **NOTE:** `revoke_certificate_on_destroy` must be set to `false`. Terraform
+provides no configuration - and therefore no write-only values - to a provider
+during a destroy, so the account key is not available to revoke the certificate.
+The provider returns a plan-time error if `revoke_certificate_on_destroy` is left
+enabled while `account_key_pem_wo` is set.
+
+-> **Rotating the account key:** since the write-only value is never stored,
+Terraform cannot detect a change to it on its own. To rotate the account key
+(for example, after the underlying secret version changes), update the key in
+your secret backend and increment
+[`account_key_pem_wo_version`](#account_key_pem_wo_version). This forces an
+in-place renewal that re-issues the certificate under the new account key. This is a
+renewal, not a replacement, so the previous certificate is **not** revoked.
+
+### Using a write-only private key
+
+By default, in domain mode (`common_name`/`subject_alternative_names`) the
+provider generates the certificate's private key and stores it in state as
+[`private_key_pem`](#private_key_pem). To keep the key out of state, supply your
+own via the [write-only][wo-args] [`private_key_pem_wo`](#private_key_pem_wo)
+argument, sourced from an [ephemeral resource][ephemeral-resources]. The
+certificate is issued with that key, but the key is never persisted - so, as
+with an [external CSR](#using-an-external-csr), `private_key_pem` and
+`certificate_p12` are left empty.
+
+This is useful when you want to generate the key and hand it to another resource
+in the same apply (for example, uploading it to a cloud certificate store)
+without it ever touching Terraform state.
+
+This requires Terraform 1.11 or later.
+
+```hcl
+ephemeral "tls_private_key" "cert_key" {
+  algorithm = "RSA"
+  rsa_bits  = 2048
+}
+
+resource "acme_certificate" "certificate" {
+  account_key_pem            = acme_registration.reg.account_key_pem
+  common_name                = "www.example.com"
+  private_key_pem_wo         = ephemeral.tls_private_key.cert_key.private_key_pem
+  private_key_pem_wo_version = 1
+
+  dns_challenge {
+    provider = "gcloud"
+  }
+}
+```
+
+-> **Rotating the key:** since the write-only value is never stored, Terraform
+cannot detect a change to it. Increment
+[`private_key_pem_wo_version`](#private_key_pem_wo_version) to rotate the key;
+this forces a new resource, re-issuing the certificate under the new key.
+
+-> The account key can independently be made write-only with
+[`account_key_pem_wo`](#account_key_pem_wo); combining the two (and/or an
+external CSR) keeps both the account key and the certificate key out of state.
+
 ## Argument Reference
 
 The resource takes the following arguments:
@@ -98,8 +189,29 @@ The resource takes the following arguments:
 `http_webroot_challenge`, `http_memcached_challenge`, or `tls_challenge`) must
 be specified. It's recommended you use `dns_challenge` whenever possible).
 
-* `account_key_pem` (Required) - The private key of the account that is
-  requesting the certificate. Forces a new resource when changed.
+* `account_key_pem` (Optional) - The private key of the account that is
+  requesting the certificate. Forces a new resource when changed. Exactly one of
+  `account_key_pem` or [`account_key_pem_wo`](#account_key_pem_wo) must be set.
+* `account_key_pem_wo` (Optional, [write-only][wo-args]) - A
+  [write-only][wo-args] version of `account_key_pem`. The value is supplied in
+  the configuration but is never written to Terraform state, allowing the
+  account key to be sourced from an [ephemeral resource][ephemeral-resources]
+  (such as
+  [`ephemeral.google_secret_manager_secret_version`][gcp-ephemeral-secret])
+  without persisting it. Exactly one of `account_key_pem` or `account_key_pem_wo`
+  must be set. Requires Terraform 1.11 or later. See [Using a write-only account
+  key](#using-a-write-only-account-key).
+* `account_key_pem_wo_version` (Optional) - Companion to `account_key_pem_wo`.
+  Because the write-only value is never stored, Terraform cannot detect when it
+  changes. Increment this integer to signal an account key rotation; doing so
+  forces an in-place certificate renewal under the new account key. Can only be set
+  together with `account_key_pem_wo`. See [Using a write-only account
+  key](#using-a-write-only-account-key).
+
+[wo-args]: https://developer.hashicorp.com/terraform/language/resources/ephemeral/write-only
+[ephemeral-resources]: https://developer.hashicorp.com/terraform/language/resources/ephemeral
+[gcp-ephemeral-secret]: https://registry.terraform.io/providers/hashicorp/google/latest/docs/ephemeral-resources/secret_manager_secret_version
+
 * `common_name` - The certificate's common name, the primary domain that the
   certificate will be recognized for. Forces a new resource when changed.
 * `subject_alternative_names` - The certificate's subject alternative names;
@@ -113,6 +225,21 @@ be specified. It's recommended you use `dns_challenge` whenever possible).
 * `certificate_request_pem` - A pre-created certificate request, such as one
   from [`tls_cert_request`][tls-cert-request], or one from an external source,
   in PEM format. Forces a new resource when changed.
+* `private_key_pem_wo` (Optional, [write-only][wo-args]) - A private key, in PEM
+  format, used to issue the certificate. Supplied in the configuration (for
+  example from
+  [`ephemeral.tls_private_key`](https://registry.terraform.io/providers/hashicorp/tls/latest/docs/ephemeral-resources/private_key))
+  but never written to state. When set, the certificate is issued with this key
+  instead of one generated by the provider, and - exactly as with
+  `certificate_request_pem` - the [`private_key_pem`](#private_key_pem) and
+  [`certificate_p12`](#certificate_p12) attributes are left empty. Conflicts with
+  `certificate_request_pem` and `key_type`. Requires Terraform 1.11 or later. See
+  [Using a write-only private key](#using-a-write-only-private-key).
+* `private_key_pem_wo_version` (Optional) - Companion to `private_key_pem_wo`.
+  Increment this integer to rotate the certificate's private key; since the
+  write-only value is never stored, this is how a change is signalled. A change
+  forces a new resource, re-issuing the certificate under the new key. Can only
+  be set together with `private_key_pem_wo`.
 
 -> One of `common_name`, `subject_alternative_names`, or
 `certificate_request_pem` must be specified. `certificate_request_pem`
@@ -269,7 +396,9 @@ Pretend Pear X1`.
 <https://letsencrypt.org/docs/profiles/>.
 
 * `revoke_certificate_on_destroy` - Enables revocation of a certificate upon destroy,
-which includes when a resource is re-created. Default is `true`.
+which includes when a resource is re-created. Default is `true`. Must be set to
+`false` when using [`account_key_pem_wo`](#account_key_pem_wo) (see [Using a
+write-only account key](#using-a-write-only-account-key)).
 
 * `revoke_certificate_reason` - Some CA's require a reason for revocation to be provided.
 Use this reason (from [RFC 5280, section 5.3.1](https://www.rfc-editor.org/rfc/rfc5280#section-5.3.1).
@@ -699,7 +828,8 @@ Refer to that field for the current URL of the certificate.
 * `private_key_pem` - The certificate's private key, in PEM format, if the
   certificate was generated from scratch and not with
   [`certificate_request_pem`](#certificate_request_pem).  If
-  `certificate_request_pem` was used, this will be blank.
+  `certificate_request_pem` or [`private_key_pem_wo`](#private_key_pem_wo) was
+  used, this will be blank.
 * `certificate_pem` - The certificate in PEM format. This does not include the
   `issuer_pem`. This certificate can be concatenated with `issuer_pem` to form
   a full chain, e.g. `"${acme_certificate.certificate.certificate_pem}${acme_certificate.certificate.issuer_pem}"`
@@ -710,7 +840,9 @@ Refer to that field for the current URL of the certificate.
   archived as a PFX file (PKCS12 format, generally used by Microsoft products).
   The data is base64 encoded (including padding), and its password is
   configurable via the [`certificate_p12_password`](#certificate_p12_password)
-  argument. This field is empty if creating a certificate from a CSR.
+  argument. This field is empty if creating a certificate from a CSR or with
+  [`private_key_pem_wo`](#private_key_pem_wo) (there is no stored private key to
+  archive).
 * `certificate_not_after` - The expiry date of the certificate, laid out in
   RFC3339 format (`2006-01-02T15:04:05Z07:00`).
 * `certificate_serial` - The serial number, in string format, as reported by

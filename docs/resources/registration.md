@@ -55,6 +55,43 @@ resource "acme_registration" "reg" {
 }
 ```
 
+### Using a write-only account key
+
+To keep the account private key out of Terraform state, supply it via the
+[write-only][wo-args] `account_key_pem_wo` argument, sourcing the value from an
+[ephemeral resource][ephemeral-resources]. The key is used during apply to
+register the account but is never persisted to state, and is **not** echoed back
+through the `account_key_pem` attribute (which stays empty).
+
+This requires Terraform 1.11 or later.
+
+```hcl
+ephemeral "google_secret_manager_secret_version" "account_key" {
+  secret = "acme-account-key"
+}
+
+resource "acme_registration" "reg" {
+  account_key_pem_wo         = ephemeral.google_secret_manager_secret_version.account_key.secret_data
+  account_key_pem_wo_version = 1
+  email_address              = "nobody@example.com"
+}
+```
+
+[wo-args]: https://developer.hashicorp.com/terraform/language/resources/ephemeral/write-only
+[ephemeral-resources]: https://developer.hashicorp.com/terraform/language/resources/ephemeral
+
+~> **NOTE:** Because Terraform provides no configuration (and therefore no
+write-only values) during refresh or destroy, the account key is unavailable
+then. As a result, when `account_key_pem_wo` is used the account is **not**
+re-resolved on refresh and is **not** deactivated on destroy - destroying the
+resource simply removes it from state and leaves the account in place on the CA.
+
+-> **Rotating the account key:** since the write-only value is never stored,
+Terraform cannot detect a change to it. Because this resource has no in-place
+update, incrementing `account_key_pem_wo_version` forces a new resource,
+registering the account afresh under the new key. The previous account is not
+deactivated (its key is not available during the destroy).
+
 #### Argument Reference
 
 ~> **NOTE:** All arguments in `acme_registration` force a new resource if
@@ -63,9 +100,19 @@ changed.
 The resource takes the following arguments:
 
 * `account_key_pem` (Optional) - The private key used to identify the account.
-  If not provided, the key will be generated according to the
-  `account_key_algorithm`, `account_key_ecdsa_curve`, and
-  `account_key_rsa_bits` settings.
+  If not provided (and `account_key_pem_wo` is not used), the key will be
+  generated according to the `account_key_algorithm`, `account_key_ecdsa_curve`,
+  and `account_key_rsa_bits` settings.
+* `account_key_pem_wo` (Optional, [write-only][wo-args]) - A write-only version
+  of `account_key_pem`: the account key is supplied in the configuration but
+  never written to state. Conflicts with `account_key_pem` and the key
+  generation settings. When used, the key must be provided (it is not generated)
+  and `account_key_pem` is left empty. Requires Terraform 1.11 or later. See
+  [Using a write-only account key](#using-a-write-only-account-key).
+* `account_key_pem_wo_version` (Optional) - Companion to `account_key_pem_wo`.
+  Increment this integer to signal an account key rotation; since the resource
+  has no in-place update, this forces a new resource (re-registration under the
+  new key). Can only be set together with `account_key_pem_wo`.
 * `account_key_algorithm` (Optional) - The algorithm to use for the private key
   when generating from scratch. Supported settings: `RSA` and `EDCSA`. Default
   settings: `ECDSA`.
@@ -95,7 +142,8 @@ The following attributes are exported:
 
 * `id`: The original full URL of the account.
 * `account_key_pem`: The private key used to identify the account (will be
-  generated if not provided).
+  generated if not provided). This is empty when `account_key_pem_wo` is used,
+  as the write-only key is never echoed back.
 * `registration_url`: The current full URL of the account.
 
 -> `id` and `registration_url` will usually be the same and will usually only
